@@ -19,6 +19,16 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 | `kalshi_exchange_status` | Exchange-level status: is the trading floor open, are deposits/withdrawals enabled, any scheduled maintenance. Cheap check before a batch script. |
 | `kalshi_macro` | Friendly-name shortcut for the most-asked Kalshi macro series: "Fed" (FOMC rate buckets), "BTC" (Bitcoin price ranges), "ETH" (Ethereum), "CPI" (monthly inflation), "GDP" (quarterly growth), "SP500" (S&P 500 EOY close), "Recession" (NBER recession calls). Returns the soonest-expiring open event for that series with all child markets + implied probabilities, so agents can ask about macro odds without knowing Kalshi's ticker scheme. |
 
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/kalshi_markets \
+  -H 'Content-Type: application/json' \
+  -d '{"keyword":"inflation"}'
+```
+
+No account needed for the first calls. Inspect any tool — schema, examples, cost — with `GET https://gateway.pipeworx.io/v1/tools/kalshi_markets`. Find one with `POST https://gateway.pipeworx.io/v1/tools/search_packs` and `{"query":"..."}`. Errors come back as JSON with a `retry_hint`.
+
 ## Quick Start
 
 Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
