@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-kalshi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Kalshi MCP — US-regulated prediction-market data (no auth on public reads).",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-kalshi": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "kalshi"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-kalshi"
+    "url": "git+https://github.com/pipeworx-io/mcp-kalshi.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-b433f04b3f05d620c53f45502ef2eb9321d3adf74fb0162b5c9cfc8df9b694df",
+    "sourceCommit": "70cd53748fc9f9a43ed3681d751bfa96e701efd2"
   }
 }

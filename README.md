@@ -1,23 +1,111 @@
-# mcp-kalshi
+# kalshi
 
-Kalshi MCP — US-regulated prediction-market data (no auth on public reads).
+Market data from **Kalshi**, the CFTC-regulated US prediction-market exchange.
+Public reads need no credential; nothing in this pack ever touches an account.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1476+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
-## Tools
+Upstream: `https://api.elections.kalshi.com/trade-api/v2` (docs:
+<https://docs.kalshi.com/llms.txt>, which serves every endpoint page as `.md`).
 
-| Tool | Description |
-|------|-------------|
-| `kalshi_markets` | List or search Kalshi prediction markets. Pass `keyword` to find markets by subject — "inflation", "Iran", "Vance" — served by Kalshi's own full-corpus search, with each result tagged match: market\|event\|related so you can tell a literal keyword hit from a relevance-ranked neighbor. Other filters: status (open\|closed\|settled), event_ticker (group by event), series_ticker (group by series like KXFED for Fed rate). Returns ticker, title, yes_ask/no_ask (in cents 1–99), volume, open_interest, and for a keyword search the event each market belongs to. Use this to discover markets; use kalshi_market for full detail. |
-| `kalshi_market` | AUTHORITATIVE detail for one Kalshi market by ticker (e.g. "KXFED-26OCT-T3.50"). Returns the rules text (so you know exactly what the market settles on — critical before quoting odds), yes_ask + no_ask prices in cents, last_price, volume, open_interest, expiration date, settlement criteria. Use after kalshi_events / kalshi_event to drill into a specific market, or when you already have a Kalshi ticker. For depth-of-book use kalshi_orderbook. |
-| `kalshi_events` | List/browse Kalshi events (event = a question with one-or-more child markets, e.g. "Fed funds rate after Oct 2026 meeting?" with 11 markets, one per rate bucket). Filter by status (open / settled), series_ticker (KXFED, KXBTC, KXCPI, etc.), or category. Use this as a discovery tool — to find what events Kalshi has open for a given topic family. For a specific event's child markets see kalshi_event; for one specific market see kalshi_market. |
-| `kalshi_event` | AUTHORITATIVE odds from Kalshi — the only CFTC-regulated US prediction-market exchange (US persons CAN legally trade here, unlike Polymarket). Returns one event with ALL its child markets nested: event title + each market's ticker, subtitle, yes_ask price, volume. Use when you need the full partition for an outright bet ("Fed funds in June 2026: each rate level is one market"). Pass include_orderbook=true to fetch live top-of-book for each market (slower but populates yes_bid/yes_ask/no_bid/no_ask + implied_yes_prob — required for most macro events since the nested response leaves prices null on the public unauth API). For cross-venue spreads vs Polymarket, see polymarket_kalshi_spread. |
-| `kalshi_series` | List Kalshi series (a series groups related events over time — e.g. "KXFED" series has one event per FOMC meeting). Useful to find the canonical handle for recurring questions. |
-| `kalshi_orderbook` | Current YES/NO orderbook (bids + asks with size, in cents) for a market ticker. Use to see live liquidity depth before judging whether an edge is tradable. Returns sorted price/quantity levels. |
-| `kalshi_trades` | Recent executed trades for a market ticker. Returns most-recent N trades with price (cents), size, side, timestamp. Useful for sanity-checking what the market is actually paying vs the resting orderbook. |
-| `kalshi_price_history` | Historical price/probability time-series (candlesticks) for a Kalshi market — how the YES odds moved over time. Pass a market ticker (e.g. "KXFEDDECISION-28JAN-H26"). Returns OHLC candles: YES price (open/high/low/close/mean as probability 0-1), best bid/ask, volume, and open interest per interval. Use for "how has this market moved", trend/momentum, or charting a prediction over time. The Kalshi analogue of polymarket_price_history. Pick interval "1h" or "1d" (default) and lookback_days. |
-| `kalshi_exchange_status` | Exchange-level status: is the trading floor open, are deposits/withdrawals enabled, any scheduled maintenance. Cheap check before a batch script. |
-| `kalshi_macro` | Friendly-name shortcut for the most-asked Kalshi macro series: "Fed" (FOMC rate buckets), "BTC" (Bitcoin price ranges), "ETH" (Ethereum), "CPI" (monthly inflation), "GDP" (quarterly growth), "SP500" (S&P 500 EOY close), "Recession" (NBER recession calls). Returns the soonest-expiring open event for that series with all child markets + implied probabilities, so agents can ask about macro odds without knowing Kalshi's ticker scheme. |
+## What is here
+
+| Tool | What it answers |
+|---|---|
+| `kalshi_markets` / `kalshi_market` | find markets by subject; one market in full, including its settlement rules |
+| `kalshi_events` / `kalshi_event` | an event and every child market (one per outcome bucket) |
+| `kalshi_series` / `kalshi_macro` | the recurring question templates; friendly-name shortcuts (Fed, CPI, BTC…) |
+| `kalshi_orderbook` / **`kalshi_orderbooks`** | depth of book for one market / for up to 100 at once |
+| `kalshi_trades` | executed trades, live or archived |
+| `kalshi_price_history` / **`kalshi_candlesticks`** | OHLC for one market with paging + archive fallback / for up to 100 on one shared window |
+| `kalshi_top_markets` | most-traded markets right now |
+| `kalshi_exchange_status` | is the floor open |
+| **`kalshi_event_live_data`** | the real-world measurement an event settles against |
+| **`kalshi_game_stats`** | live score + play-by-play for a sports milestone |
+| **`kalshi_milestones`** | the occurrences Kalshi hangs markets off, and which events belong to each |
+| **`kalshi_structured_targets`** | the entities (players, teams, actors, films, companies) markets refer to |
+| **`kalshi_weather_index`** / **`kalshi_weather_index_calibrations`** | the city temperature index temperature markets settle on, and how it is computed |
+
+Bold rows landed 2026-09-16 (fleet #2040). The bucket assignment for all eight
+probed endpoint families, with the literal responses, is in
+`docs/pack-build-queue.md`.
+
+## Traps already paid for
+
+**Kalshi filters Cloudflare egress on its listing endpoints.** Several endpoints
+return empty to a Workers IP. The gateway injects `_proxyUrl`/`_proxyToken` and
+`kalshiGet()` routes every upstream fetch through the relay when they are
+present. Anything new must go through `kalshiGet`, never a bare `fetch`.
+
+**Auth-gated vs broken is legible on this API, so check before concluding.** An
+endpoint that needs a credential answers `401
+{"error":{"code":"token_authentication_failure"}}`. A `400 bad_request` is the
+handler refusing, not a missing key.
+
+**`/markets/orderbooks` takes `tickers` repeated; `/markets/candlesticks` takes
+`market_tickers` comma-separated.** Two batch endpoints on the same API, two
+different array conventions. Getting it wrong is a 400, not a silent subset.
+
+**The batch candlestick response labels each group `market_ticker`, not
+`ticker`.** Pair by that label. Pairing by request order would attribute one
+market's entire price history to another and still return 200.
+
+**Kalshi caps batch candlesticks at 10,000 candles across ALL requested markets
+and gives no cursor there.** `kalshi_candlesticks` reports
+`truncated_by_upstream`. For one ticker over a long window — or a market old
+enough to be archived — use `kalshi_price_history`, which pages and falls back to
+the archive; the batch endpoint does neither.
+
+**`/live_data/events/{ticker}` is 404 for most events, and that is normal.** It
+exists for crypto price events and some economic-series events. `found:false` is
+the honest answer, not an error. A live BTC event's payload is ~473 KB, which is
+why series are trimmed to `max_points` with `series_trimmed` reporting the
+untrimmed length.
+
+**Weather is city-keyed, not event-keyed.** `KXHIGHNY-26SEP16` 404s on the event
+live-data endpoint. The observations live at `/live_data/weather/{city}` and
+exist whether or not a market is open.
+
+**There are exactly thirteen weather-index city ids, and they are ids, not place
+names**: `miami`, `dfw`, `houston`, `phl-delaware-valley`, `puget-sound`,
+`sf-bay`, `greater-boston`, `southeast-michigan`, `kansas-city`,
+`minneapolis-st-paul`, `nyc`, `chicago`, `la-coastal`. Kalshi enumerates them in
+its own rejection message for an unknown city. `austin` is not one. The index is
+per-minute, so a window under ~2 minutes can legitimately return zero points.
+`from`/`to` here are unix **milliseconds**; `last_sec` is seconds.
+
+**Weather-index station offsets are in Celsius while the index itself is
+published in Fahrenheit.** (`kalshi_weather_index_calibrations`.)
+
+**`/live_data/milestone/{id}/game_stats` answers 200 with `{"pbp":{}}` for a
+milestone Sportradar does not cover** — verified on a college football game,
+2026-09-16. `plays_available:false` says so rather than passing an empty array
+off as a game with no plays. Documented coverage: Pro/College Football,
+Pro/College Basketball, WNBA, Soccer, Pro Hockey, Pro Baseball.
+
+**`/structured_targets` does not reject an unknown `type` — it returns 200 with
+an empty list.** The types are granular by sport; there is no bare `player`,
+`team` or `athlete` (`type=player` matches exactly one test row named
+`testingmaxxiong`). The handler names the known types whenever a filtered query
+comes back empty, so a typo cannot read as "Kalshi has no NFL players".
+
+**`/milestones` requires `limit`** (a 400 without it) and its unfiltered page
+skews heavily historical — pass `minimum_start_date` for current occurrences.
+
+**`forecast_percentile_history` validates and then refuses.** Full evidence in
+`docs/pack-build-queue.md`; do not re-probe it looking for the right parameters.
+
+## Development
+
+```bash
+node scripts/sync-catalog.mjs          # after any tool change
+pnpm check:examples                     # tool-examples.json must cover new tools
+```
+
+Smoke-test through the live gateway with the internal header, never with a BYO
+key (`scripts/pwcall.sh call kalshi_weather_index '{"city":"nyc"}'`), and check
+the payload is non-empty — a 200 with an empty array passes every CI gate and is
+still a failed smoke test.
 
 ## Quick Start
 
@@ -63,9 +151,45 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1476+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/kalshi_markets \
+  -H 'Content-Type: application/json' \
+  -d '{"keyword":"inflation"}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/kalshi_markets`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+
+## Standalone (no gateway account)
+
+This package also runs as a local stdio MCP server — no Pipeworx account, no
+gateway round-trip:
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "npx",
+      "args": ["-y", "@pipeworx/mcp-kalshi"]
+    }
+  }
+}
+```
+
+Or run it directly to confirm it starts:
+
+```bash
+npx -y @pipeworx/mcp-kalshi
+```
+
+It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
+for **only** this pack's tools — none of the shared meta-tools the gateway
+connection above adds. Same source, same tools, no ask_pipeworx routing.
 
 ## Using with ask_pipeworx
 
@@ -86,13 +210,3 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
-
-## No MCP client? Call it over HTTP
-
-```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/kalshi_markets \
-  -H 'Content-Type: application/json' \
-  -d '{"keyword":"inflation"}'
-```
-
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/kalshi_markets`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
