@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -669,6 +685,254 @@ function pickMessage(node: unknown, depth: number): string | null {
  *  whitespace make a multi-line body unreadable there. */
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
+}
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
 }
 /**
  * Kalshi MCP — US-regulated prediction-market data (no auth on public reads).
@@ -1223,17 +1487,31 @@ async function eventScanSearch(keyword: string, re: RegExp, status: string, limi
   let scanned = 0;
   let cursor: string | undefined;
   let exhausted = false;
+  let scanRefusal: unknown = null;
   for (let page = 0; page < MAX_EVENT_PAGES; page++) {
     const q = new URLSearchParams({ status, limit: String(PAGE) });
     if (cursor) q.set('cursor', cursor);
     const data = (await kalshiGet(`/events?${q}`)) as { events?: KalshiEventLite[]; cursor?: string };
-    const events = data.events ?? [];
+    // A refused page has no `events`. Read as `[]` it ended the scan with
+    // scan_complete TRUE and "no event mentions <keyword>" -- a confident "does
+    // not exist" for "we were not allowed to look" (fleet #3524).
+    if (errorOf(data)) { scanRefusal = data; break; }
+    const events = data.events ?? []; // 200 page with no `events` key: an empty page, scan ends
     scanned += events.length;
     for (const e of events) {
       if (re.test(`${e.title ?? ''} ${e.sub_title ?? ''} ${e.series_ticker ?? ''}`)) matched.push(e);
     }
     cursor = data.cursor ?? undefined;
     if (!cursor || !events.length) { exhausted = true; break; }
+  }
+
+  if (!matched.length && scanRefusal) {
+    return refusal(scanRefusal, {
+      keyword,
+      events_scanned: scanned,
+      scan_complete: false,
+      hint: `Kalshi did not serve the event listing, so this is NOT a statement that no event mentions "${keyword}". Retry in a minute.`,
+    });
   }
 
   if (!matched.length) {
@@ -1253,11 +1531,14 @@ async function eventScanSearch(keyword: string, re: RegExp, status: string, limi
   await resolveSeriesCategories(matched.map((e) => e.series_ticker ?? seriesTickerOf(e.event_ticker)));
   const markets: unknown[] = [];
   const usedEvents: string[] = [];
+  const refusedEvents: string[] = [];
+  let marketsRefusal: unknown = null;
   for (const e of matched) {
     if (markets.length >= limit || !e.event_ticker) break;
     const q = new URLSearchParams({ status, limit: String(Math.min(1000, limit)), event_ticker: e.event_ticker });
     const data = (await kalshiGet(`/markets?${q}`)) as { markets?: KalshiMarket[] };
-    for (const m of data.markets ?? []) {
+    if (errorOf(data)) { marketsRefusal ??= data; refusedEvents.push(e.event_ticker); continue; }
+    for (const m of data.markets ?? []) { // 200 for a real event: an event with no markets in this status
       if (markets.length >= limit) break;
       markets.push({
         ...formatMarket({ ...m, event_ticker: m.event_ticker ?? e.event_ticker, series_ticker: m.series_ticker ?? e.series_ticker }),
@@ -1268,12 +1549,30 @@ async function eventScanSearch(keyword: string, re: RegExp, status: string, limi
     usedEvents.push(e.event_ticker);
   }
 
+  if (!markets.length && marketsRefusal) {
+    return refusal(marketsRefusal, {
+      keyword,
+      matched_events: matched.length,
+      events_refused: refusedEvents,
+      events_scanned: scanned,
+      scan_complete: exhausted,
+      hint: `Kalshi matched ${matched.length} event(s) for "${keyword}" but refused to list their markets, so this is NOT a statement that they have none. Retry in a minute.`,
+    });
+  }
+
   return {
     found: markets.length > 0,
     keyword,
     count: markets.length,
     matched_events: matched.length,
     events_used: usedEvents,
+    ...(refusedEvents.length || scanRefusal
+      ? {
+          partial: true,
+          ...(refusedEvents.length ? { events_refused: refusedEvents } : {}),
+          ...(scanRefusal ? { scan_refusal: refusal(scanRefusal) } : {}),
+        }
+      : {}),
     // Say what was read. A bounded search that does not disclose its bound is
     // indistinguishable from a complete one.
     events_scanned: scanned,
@@ -1312,7 +1611,10 @@ async function findTopMarkets(args: Record<string, unknown>) {
   const searchData = (await kalshiGet(
     'https://api.elections.kalshi.com/v1/search/series?query=&page_size=200',
   )) as { current_page?: KalshiSearchRow[]; error?: string };
-  const rows = searchData.current_page ?? [];
+  // A refused search has no `current_page`; read as [] it answered "no
+  // candidates found ... try status any" for a rate limit (fleet #3524).
+  if (errorOf(searchData)) return refusal(searchData, { sort_by: by, status_filter: status });
+  const rows = searchData.current_page ?? []; // 200 without a page: the index has no rows
 
   const now = Date.now();
   const seen = new Set<string>();
@@ -1348,12 +1650,19 @@ async function findTopMarkets(args: Record<string, unknown>) {
   const enrichCap = by === 'volume' ? limit : Math.min(60, candidates.length);
   const toEnrich = candidates.slice(0, Math.min(enrichCap, candidates.length));
 
+  const detailRefusals: unknown[] = [];
   const enriched = await Promise.all(
     toEnrich.map(async (c) => {
       const data = (await kalshiGet(`/markets/${encodeURIComponent(c.ticker)}`)) as { market?: KalshiMarket };
+      // not_found = delisted since the index row was written: skip it. Anything
+      // else is a refusal, and is counted rather than read as "no such market".
+      if (isRefusal(data)) { detailRefusals.push(data); return null; }
       return data.market ? formatMarket(data.market) : null;
     }),
   );
+  if (detailRefusals.length === toEnrich.length) {
+    return refusal(detailRefusals[0], { sort_by: by, status_filter: status, candidates_considered: candidates.length, detail_requests_refused: detailRefusals.length });
+  }
   const valid = enriched.filter((m): m is Record<string, unknown> => m !== null);
   valid.sort((a, b) => (Number(b[by]) || 0) - (Number(a[by]) || 0));
   const markets = valid.slice(0, limit);
@@ -1366,6 +1675,7 @@ async function findTopMarkets(args: Record<string, unknown>) {
     count: markets.length,
     candidates_considered: candidates.length,
     enriched_count: valid.length,
+    ...(detailRefusals.length ? { detail_requests_refused: detailRefusals.length, partial: true } : {}),
     markets,
     as_of: new Date().toISOString(),
     source: 'kalshi',
@@ -1412,7 +1722,15 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       for (let attempt = 0; unscoped && !(data.markets && data.markets.length) && attempt < 3; attempt++) {
         data = (await kalshiGet(`/markets?${params}`)) as { markets?: KalshiMarket[]; cursor?: string };
       }
-      const rows = data.markets ?? [];
+      // kalshiGet SOFT-FAILS: a 429 or a 5xx comes back as `{error, message}`
+      // with no `markets`, not as a throw. Reading `data.markets ?? []` off that
+      // returned `{count: 0, markets: []}` -- a clean, empty success -- for a
+      // refused listing. The prediction-calibration collector read exactly that
+      // as "no market closed in the band" and recorded `windows_examined 0,
+      // errors []` on 130 consecutive cron firings (fleet #3516). A refusal is
+      // not an empty listing, so hand it back as the refusal it is.
+      if (!data.markets && (data as { error?: unknown }).error) return data;
+      const rows = data.markets ?? []; // guarded above: reached only for a 200 (a 200 with no `markets` key is an empty page)
       // /markets has no category field, so resolve it from each market's
       // series before formatting. Bounded and cached; whatever the budget
       // could not reach is named rather than left as a silent null.
@@ -1434,6 +1752,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'kalshi_market': {
       const ticker = reqStr(args, 'ticker', '"KXFED-26OCT-T3.50"');
       const data = (await kalshiGet(`/markets/${encodeURIComponent(ticker)}`)) as { market?: KalshiMarket };
+      // A refused lookup is not "no such market": it used to fall through to the
+      // archive and end in found:false + "call kalshi_markets to find a valid
+      // ticker" for a rate limit (fleet #3524). Only a 404 means "not live".
+      if (isRefusal(data)) return refusal(data, { found: false, ticker });
       let market = data.market ?? null;
       let source: 'live' | 'archive' = 'live';
       if (!market) {
@@ -1444,6 +1766,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         const arch = (await kalshiGet(
           `${ARCHIVE_BASE}/markets?tickers=${encodeURIComponent(ticker)}&limit=1`,
         )) as { markets?: KalshiMarket[] };
+        if (isRefusal(arch)) return refusal(arch, { found: false, ticker, searched: ['live /markets/{ticker}: not found', 'archive: refused'] });
         const hit = (arch.markets ?? []).find((m) => (m.ticker ?? '').toUpperCase() === ticker.toUpperCase());
         if (hit) {
           market = hit;
@@ -1538,9 +1861,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       if (!events.length && !scanned && !args.series_ticker && !args.cursor) {
         const mk = (await kalshiGet(
           `/markets?status=${encodeURIComponent(status)}&limit=200`,
-        )) as { markets?: KalshiMarket[] };
+        )) as { markets?: KalshiMarket[]; error?: string; message?: string };
+        // The first listing was an empty 200 (the datacenter-IP filter), so this
+        // is the answer of last resort -- and it can be refused too. Left to
+        // `?? []` it derived zero events and returned count:0 with no error.
+        if (mk.error) upstreamError = { error: mk.error, message: mk.message };
         const byEvent = new Map<string, { event_ticker: string; series_ticker: string; markets_count: number }>();
-        for (const m of mk.markets ?? []) {
+        for (const m of mk.markets ?? []) { // refusal already recorded above; here a 200 with no rows is a real empty browse
           const et = m.event_ticker;
           if (!et) continue;
           const existing = byEvent.get(et);
@@ -1638,12 +1965,15 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       if (!data.event) return { found: false, event_ticker: et };
       let markets = data.event.markets ?? [];
       let orderbookBatches: number | null = null;
+      let orderbookRefusal: unknown = null;
       if (includeOrderbook && markets.length > 0) {
         // Kalshi's nested-markets response leaves prices null for many macro
         // events on the unauth API; the orderbook endpoint does expose depth.
         // One batch call per 100 markets covers the whole partition.
         const target = Number.isFinite(obLimit) ? markets.slice(0, obLimit as number) : markets;
-        const patched = await enrichMarketsWithOrderbooks(target);
+        const enrichment = await enrichMarketsWithOrderbooks(target);
+        const patched = enrichment.markets;
+        orderbookRefusal = enrichment.refusal;
         orderbookBatches = Math.ceil(target.length / 100);
         markets = Number.isFinite(obLimit) ? [...patched, ...markets.slice(patched.length)] : patched;
       }
@@ -1655,7 +1985,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           ? {
               orderbook_source: 'kalshi_batch_orderbooks',
               orderbook_requests: orderbookBatches,
-              orderbook_markets_covered: Number.isFinite(obLimit) ? Math.min(markets.length, obLimit as number) : markets.length,
+              orderbook_markets_covered: orderbookRefusal
+                ? 0
+                : Number.isFinite(obLimit) ? Math.min(markets.length, obLimit as number) : markets.length,
+              // Kalshi refused the batch orderbook call: the prices above are
+              // whatever the event itself carried, NOT enriched. Said, not implied.
+              ...(orderbookRefusal ? { orderbook_error: refusal(orderbookRefusal) } : {}),
             }
           : {}),
       };
@@ -1665,6 +2000,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       params.set('limit', String(Math.min(1000, Math.max(1, (args.limit as number) ?? 200))));
       if (args.category) params.set('category', String(args.category));
       const data = (await kalshiGet(`/series?${params}`)) as { series?: Array<Record<string, unknown>> };
+      if (errorOf(data)) return refusal(data); // a refused listing is not "zero series"
       return {
         count: data.series?.length ?? 0,
         series: (data.series ?? []).map((s) => ({
@@ -1678,15 +2014,31 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'kalshi_orderbook': {
       const ticker = reqStr(args, 'ticker', '"KXFED-26OCT-T3.50"');
       const depth = Math.min(100, Math.max(1, (args.depth as number) ?? 5));
+      // Kalshi's wire shape is `orderbook_fp: {yes_dollars, no_dollars}` -- arrays
+      // of [price, size] STRINGS, bids only, low -> high (verified live
+      // 2026-10-23, and it is what kalshi_orderbooks already reads). This used
+      // to read `orderbook.yes` / `orderbook.no`, keys Kalshi no longer sends,
+      // so `?? []` turned EVERY book into an empty one: a 200 with
+      // yes_bids:[] / no_bids:[] for a market with 280k contracts resting.
       const data = (await kalshiGet(
         `/markets/${encodeURIComponent(ticker)}/orderbook?depth=${depth}`,
-      )) as { orderbook?: { yes?: number[][]; no?: number[][] } };
-      const ob = data.orderbook ?? {};
+      )) as { orderbook_fp?: { yes_dollars?: Array<[string, string]>; no_dollars?: Array<[string, string]> } };
+      if (errorOf(data)) return refusal(data, { ticker }); // a refused call is not an empty book
+      const ob = data.orderbook_fp ?? {};
+      const yesRaw = ob.yes_dollars ?? []; // Kalshi sends [] for a side nobody is bidding on
+      const noRaw = ob.no_dollars ?? [];
+      const level = ([price, qty]: [string, string]) => ({
+        price_cents: centsOf(price),
+        price_dollars: parseFloat(price),
+        quantity: parseFloat(qty),
+      });
       return {
         ticker,
-        yes_bids: (ob.yes ?? []).map(([price, qty]) => ({ price_cents: price, quantity: qty })),
-        no_bids: (ob.no ?? []).map(([price, qty]) => ({ price_cents: price, quantity: qty })),
-        note: 'Kalshi quotes in cents (1-99). yes_bid X means someone will pay X cents for a YES contract that pays $1 on YES resolution. Implied YES probability = price_cents / 100.',
+        yes_bids: [...yesRaw].reverse().slice(0, depth).map(level),
+        no_bids: [...noRaw].reverse().slice(0, depth).map(level),
+        levels_available: { yes: yesRaw.length, no: noRaw.length },
+        quoted: yesRaw.length > 0 || noRaw.length > 0,
+        note: 'Bids only, best (highest) first, in cents (1-99) and full-precision dollars. yes_bid X means someone will pay X cents for a YES contract that pays $1 on YES resolution; an ask on one side is 1 minus the other side\'s best bid. Implied YES probability = price_cents / 100. `quoted:false` means nobody is resting an order; Kalshi answers the same way for a ticker that does not exist, so confirm the ticker with kalshi_market.',
       };
     }
     case 'kalshi_trades': {
@@ -1696,12 +2048,16 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         `/markets/trades?ticker=${encodeURIComponent(ticker)}&limit=${limit}`,
       )) as { trades?: Array<Record<string, unknown>>; cursor?: string };
       let source: 'live' | 'archive' = 'live';
+      // A refused live call has no `trades` either: it used to look like an
+      // archived market, fall through, and come back count:0 source:"live" (#3524).
+      if (isRefusal(data)) return refusal(data, { ticker });
       if (!(data.trades && data.trades.length)) {
         // The live trades endpoint answers 200 with `trades: []` for an
         // archived market — a clean, wrong "this market never traded".
         const arch = (await kalshiGet(
           `${ARCHIVE_BASE}/trades?ticker=${encodeURIComponent(ticker)}&limit=${limit}`,
         )) as { trades?: Array<Record<string, unknown>>; cursor?: string };
+        if (isRefusal(arch)) return refusal(arch, { ticker, tried: ['live: no trades', 'archive: refused'] });
         const rows = (arch.trades ?? []).filter(
           (t) => String(t.ticker ?? '').toUpperCase() === ticker.toUpperCase(),
         );
@@ -1884,7 +2240,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       }
       // Find the soonest-expiring open event for this series.
       const events = (await kalshiGet(`/events?series_ticker=${series}&status=open&limit=50`)) as { events?: KalshiEvent[] };
-      const open = events.events ?? [];
+      // A refused listing is not "no open events for this series" (fleet #3524).
+      if (errorOf(events)) return refusal(events, { topic, series_ticker: series });
+      const open = events.events ?? []; // 200 with no `events`: the series has nothing open
       if (open.length === 0) {
         return { topic, series_ticker: series, found: false, message: `No open events for series ${series}.` };
       }
@@ -1895,7 +2253,18 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       const detail = (await kalshiGet(
         `/events/${encodeURIComponent(ev.event_ticker ?? '')}?with_nested_markets=true`,
       )) as { event?: KalshiEvent & { markets?: KalshiMarket[] } };
-      const markets = (detail.event?.markets ?? []).map((m) => formatMarket(m));
+      // The event was found but its markets were refused: say so, and keep the
+      // event we do have, rather than returning it with markets:[] beside it.
+      if (errorOf(detail)) {
+        return refusal(detail, {
+          topic,
+          series_ticker: series,
+          event: formatEvent(ev),
+          other_open_events: open.slice(1, 6).map(formatEvent),
+          hint: 'Found the soonest open event but Kalshi refused its markets, so no prices are returned. Retry in a minute or call kalshi_event with this event_ticker.',
+        });
+      }
+      const markets = (detail.event?.markets ?? []).map((m) => formatMarket(m)); // event nests no markets: leaf default on a 200
       return {
         topic,
         series_ticker: series,
@@ -2082,6 +2451,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       if (isNotFound(stateRes) && isNotFound(statsRes)) {
         return { found: false, milestone_id: id, message: `Kalshi has no milestone ${id}. Find one with kalshi_milestones.` };
       }
+      // A refused leg used to be read as `{}`, and the tool answered found:true
+      // with scoreboard:null and "Kalshi answered 200 with no play-by-play" --
+      // a 200 claim about a 429 (fleet #3524).
+      if (isRefusal(stateRes) || isRefusal(statsRes)) {
+        return refusal(isRefusal(stateRes) ? stateRes : statsRes, { found: false, milestone_id: id });
+      }
       const state = (stateRes as { live_data?: { type?: string; details?: Record<string, unknown> } }).live_data;
       const pbp = (statsRes as { pbp?: { periods?: Array<Record<string, unknown>> } }).pbp ?? {};
       const periods = Array.isArray(pbp.periods) ? pbp.periods : [];
@@ -2211,6 +2586,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         message?: string;
         status?: number;
       };
+      // ONLY a 400 means Kalshi rejected the city (verified live: HTTP 400
+      // "unknown weather index city"). Every other soft failure -- a 429 above
+      // all -- used to be reported as "Kalshi has no weather index for nyc"
+      // with nyc listed among the supported cities, i.e. a rate limit blamed on
+      // the caller's input (fleet #3524).
+      if (data.error && !isBadRequest(data) && !isNotFound(data)) return refusal(data, { city });
       if (data.error) {
         return {
           error: 'unknown_city',
@@ -2250,6 +2631,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         error?: string;
         message?: string;
       };
+      // ONLY a 400 means Kalshi rejected the city (verified live: HTTP 400
+      // "unknown weather index city"). Every other soft failure -- a 429 above
+      // all -- used to be reported as "Kalshi has no weather index for nyc"
+      // with nyc listed among the supported cities, i.e. a rate limit blamed on
+      // the caller's input (fleet #3524).
+      if (data.error && !isBadRequest(data) && !isNotFound(data)) return refusal(data, { city });
       if (data.error) {
         return {
           error: 'unknown_city',
@@ -2612,9 +2999,12 @@ function roundDollars(n: number): number {
  * child market past the 30th on a larger event (fleet #2040). Markets that
  * already carry a quote are left alone and not re-requested.
  */
-async function enrichMarketsWithOrderbooks(markets: KalshiMarket[]): Promise<KalshiMarket[]> {
+async function enrichMarketsWithOrderbooks(
+  markets: KalshiMarket[],
+): Promise<{ markets: KalshiMarket[]; refusal: unknown }> {
   const need = markets.filter((m) => m.ticker && !m.yes_ask_dollars && !m.yes_bid_dollars);
-  if (need.length === 0) return markets;
+  if (need.length === 0) return { markets, refusal: null };
+  let batchRefusal: unknown = null;
   const books = new Map<string, { yes: Array<[string, string]>; no: Array<[string, string]> }>();
   for (let i = 0; i < need.length; i += 100) {
     const chunk = need.slice(i, i + 100);
@@ -2623,7 +3013,10 @@ async function enrichMarketsWithOrderbooks(markets: KalshiMarket[]): Promise<Kal
     const res = (await kalshiGet(`/markets/orderbooks?${params}`)) as {
       orderbooks?: Array<{ ticker?: string; orderbook_fp?: { yes_dollars?: Array<[string, string]>; no_dollars?: Array<[string, string]> } }>;
     };
-    for (const b of res.orderbooks ?? []) {
+    // A refused batch has no `orderbooks`; read as [] the event came back
+    // "enriched" with orderbook_markets_covered = N and not one price added.
+    if (errorOf(res)) { batchRefusal ??= res; continue; }
+    for (const b of res.orderbooks ?? []) { // 200 with no books: nothing resting
       if (!b.ticker) continue;
       books.set(String(b.ticker).toUpperCase(), {
         yes: b.orderbook_fp?.yes_dollars ?? [],
@@ -2631,7 +3024,7 @@ async function enrichMarketsWithOrderbooks(markets: KalshiMarket[]): Promise<Kal
       });
     }
   }
-  return markets.map((m) => {
+  const enrichedMarkets = markets.map((m) => {
     if (!m.ticker) return m;
     const book = books.get(m.ticker.toUpperCase());
     if (!book) return m;
@@ -2652,6 +3045,7 @@ async function enrichMarketsWithOrderbooks(markets: KalshiMarket[]): Promise<Kal
       no_bid_size: m.no_bid_size ?? (bestNo ? bestNo[1] : undefined),
     } as KalshiMarket;
   });
+  return { markets: enrichedMarkets, refusal: batchRefusal };
 }
 
 function formatEvent(e: KalshiEvent): Record<string, unknown> {
@@ -2692,6 +3086,36 @@ function isNotFound(v: unknown): boolean {
 function errorOf(v: unknown): string | null {
   const e = (v as { error?: unknown } | null | undefined)?.error;
   return typeof e === 'string' ? e : null;
+}
+
+/**
+ * kalshiGet SOFT-FAILS (a 429 or 5xx is returned as `{error, message}`, not
+ * thrown), so every `data.<collection> ?? []` read straight off its result turns
+ * a REFUSED call into an empty, successful-looking answer -- the fleet #3516
+ * defect. A tool that gets a soft failure it cannot recover from hands it back
+ * through this, named, with the context it already has -- and with NO empty
+ * collection beside it, so a caller reading `.count` / `.markets` / `.found`
+ * cannot mistake "we were not allowed to look" for "there is nothing there".
+ * fleet #3524.
+ */
+function refusal(v: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  const o = (v ?? {}) as { error?: unknown; message?: unknown; status?: unknown };
+  return {
+    ...extra,
+    error: o.error,
+    message: o.message,
+    ...(o.status !== undefined ? { status: o.status } : {}),
+  };
+}
+
+/** A soft failure that is a REFUSAL: an error that is not "Kalshi has no such thing". */
+function isRefusal(v: unknown): boolean {
+  return errorOf(v) !== null && !isNotFound(v);
+}
+
+/** HTTP 400 from Kalshi: it rejected a parameter value (e.g. an unknown weather-index city). */
+function isBadRequest(v: unknown): boolean {
+  return errorOf(v) === 'upstream_error' && (v as { status?: unknown }).status === 400;
 }
 
 // Kalshi's own per-request ceiling on candlesticks, verified 2026-09-15 on both

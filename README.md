@@ -3,7 +3,7 @@
 Market data from **Kalshi**, the CFTC-regulated US prediction-market exchange.
 Public reads need no credential; nothing in this pack ever touches an account.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 Upstream: `https://api.elections.kalshi.com/trade-api/v2` (docs:
 <https://docs.kalshi.com/llms.txt>, which serves every endpoint page as `.md`).
@@ -92,6 +92,17 @@ comes back empty, so a typo cannot read as "Kalshi has no NFL players".
 **`/milestones` requires `limit`** (a 400 without it) and its unfiltered page
 skews heavily historical — pass `minimum_start_date` for current occurrences.
 
+**A refused call is an error, never an empty answer (fleet #3516, #3524).** A
+rate limit or a 5xx from Kalshi comes back from every tool as `error`
+(`rate_limited` / `upstream_error`) with `message`, and none of the fields that
+would make it read as a result: no `count: 0`, no `found: false` standing in for
+"does not exist", no empty `markets` / `trades` / `series` / order book. Where a
+tool fans out and only part of it is refused, the answer says so
+(`partial: true`, `detail_requests_refused`, `events_refused`, `orderbook_error`)
+instead of reporting the surviving part as the whole. `kalshi_weather_index*`
+reports `unknown_city` only for Kalshi's own HTTP 400 on the city. Pinned per
+tool in `src/__tests__/refusal-not-empty.test.ts`.
+
 **`forecast_percentile_history` validates and then refuses.** Full evidence in
 `docs/pack-build-queue.md`; do not re-probe it looking for the right parameters.
 
@@ -151,7 +162,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

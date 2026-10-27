@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-kalshi",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Kalshi MCP — US-regulated prediction-market data (no auth on public reads).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-b22be7623c0869b6fbd58c09b47eb40495a50e841f8ffa9bb9013bebc7c02e39",
-    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
+    "sourceHash": "v1-d629736602144caea9b1906e8a2480474ab69614335f51f7e5b3da3cf40f47bd",
+    "sourceCommit": "33741fe6d9ba71856e73fa683c73572d1ddf2e93"
   }
 }
